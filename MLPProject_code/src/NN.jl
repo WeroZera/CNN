@@ -3,8 +3,10 @@ module NN
 using ..AD
 using Random
 using LinearAlgebra
+using Statistics
+using Printf
 
-export Dense, Chain, relu, sigmoid, softmax, binarycrossentropy, params, update!, DataLoader, Adam, Dropout, clip_gradients!
+export Dense, Chain, relu, sigmoid, softmax, binarycrossentropy, params, update!, DataLoader, Adam, Dropout, clip_gradients!, loss_and_grad, train_model
 
 const ADValue = AD.ADValue
 
@@ -211,6 +213,21 @@ function params(model)
     return ps
 end
 
+# Binary cross-entropy loss with direct gradient computation
+function loss_and_grad(model, x, y)
+    y_pred = vec(model(x))  # convert (batch_size, 1) → (batch_size)
+
+    ϵ = Float32(1e-7)
+    ŷ = clamp.(y_pred, ϵ, 1f0 - ϵ)
+    loss = -mean(y .* log.(ŷ) .+ (1f0 .- y) .* log.(1f0 .- ŷ))
+
+    grad_pred = (y_pred .- y) ./ (y_pred .* (1f0 .- y_pred))
+    grad_pred ./= length(y)
+    grad_pred = reshape(grad_pred, :, 1)  # convert back to (batch_size, 1) for backward pass
+
+    return loss, grad_pred
+end
+
 binarycrossentropy(ŷ, y) = AD.binarycrossentropy(ŷ, y)
 
 # DataLoader definition
@@ -257,6 +274,70 @@ function clip_gradients!(grads_cache, threshold::Float32)
             end
         end
     end
+end
+
+function loss_and_grad(model, x, y)
+    y_pred = vec(model(x))
+
+    ϵ = Float32(1e-7)
+    ŷ = clamp.(y_pred, ϵ, 1f0 - ϵ)
+    loss = -mean(y .* log.(ŷ) .+ (1f0 .- y) .* log.(1f0 .- ŷ))
+
+    grad_pred = (y_pred .- y) ./ (y_pred .* (1f0 .- y_pred))
+    grad_pred ./= length(y)
+    grad_pred = reshape(grad_pred, :, 1)
+
+    return loss, grad_pred
+end
+function train_model(model, dataset, test_X, test_y, opt, epochs, patience)
+    best_val_loss = Inf
+    patience_counter = 0
+    best_model_state = nothing
+    current_model = deepcopy(model)
+
+    for epoch in 1:epochs
+        total_loss = 0.0
+        total_acc = 0.0
+        num_batches = 0
+
+        for layer in current_model.layers
+            if layer isa Dropout
+                layer.is_training = true
+            end
+        end
+
+        epoch_time = @elapsed begin
+            for (x, y) in dataset
+                loss_val, grad_output = loss_and_grad(current_model, x, y)
+                grads_cache = backward!(current_model, reshape(grad_output, :, 1))
+                clip_gradients!(grads_cache, 5.0f0)
+                update!(current_model, grads_cache, opt)
+                total_loss += loss_val
+                total_acc += mean((vec(current_model(x)) .> 0.5) .== (y .> 0.5))
+                num_batches += 1
+            end
+        end
+
+        for layer in current_model.layers
+            if layer isa Dropout
+                layer.is_training = false
+            end
+        end
+
+        train_loss = total_loss / num_batches
+        train_acc = total_acc / num_batches
+
+        # Ewaluacja na testowym
+        ŷ_test = vec(current_model(test_X))
+        ϵ = Float32(1e-7)
+        ŷ_clamped = clamp.(ŷ_test, ϵ, 1f0 - ϵ)
+        test_loss = -mean(test_y .* log.(ŷ_clamped) .+ (1f0 .- test_y) .* log.(1f0 .- ŷ_clamped))
+        test_acc = mean((ŷ_test .> 0.5) .== (test_y .> 0.5))
+
+        @printf "Epoch: %-2d (%.2fs)   Train: (l: %.4f, a: %.4f)   Test: (l: %.4f, a: %.4f)\n" epoch epoch_time train_loss train_acc test_loss test_acc
+    end
+
+    return current_model
 end
 
 end # module
