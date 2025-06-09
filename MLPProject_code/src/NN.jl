@@ -6,9 +6,102 @@ using LinearAlgebra
 using Statistics
 using Printf
 
-export Dense, Chain, relu, sigmoid, softmax, binarycrossentropy, params, update!, DataLoader, Adam, Dropout, clip_gradients!, train_model
+export Dense, Chain, relu, sigmoid, softmax, binarycrossentropy, params, update!,
+       DataLoader, Adam, Dropout, clip_gradients!, train_model,
+       Embedding, Conv1D, MaxPool1D, flatten
 
 const ADValue = AD.ADValue
+
+# Then define Dense layer
+mutable struct Dense
+    W::Matrix{Float32}
+    b::Vector{Float32}
+    σ::Function
+    weight_decay::Float32  # Add weight decay parameter
+    # Cache for backward pass
+    last_input::Matrix{Float32}
+    last_output::Matrix{Float32}
+    last_pre_activation::Matrix{Float32}
+end
+
+# Add Dropout layer
+mutable struct Dropout
+    p::Float32
+    is_training::Bool
+end
+
+# Define Chain
+mutable struct Chain
+    layers::Vector{Any}
+    grad_cache::Vector{Any}
+end
+
+mutable struct Embedding
+    vocab_size::Int
+    embedding_dim::Int
+    weight::Array{Float32, 2}
+end
+
+mutable struct Conv1D
+    kernel_size::Int
+    in_channels::Int
+    out_channels::Int
+    weight::Array{Float32, 3}
+    bias::Vector{Float32}
+    activation::Function
+end
+
+mutable struct MaxPool1D
+    pool_size::Int
+end
+
+flatten(x) = reshape(x, :, size(x, 3))
+
+const Layer = Union{Dense, Dropout, Chain, Embedding, Conv1D, MaxPool1D, typeof(flatten)}
+
+# CNN Components
+
+function Embedding(vocab_size::Int, embedding_dim::Int, weights::Array{<:Real,2})
+    Embedding(vocab_size, embedding_dim, Float32.(weights))
+end
+
+function (e::Embedding)(x::AbstractArray)
+    return e.weight[:, x]
+end
+
+function Conv1D(k::Int, c_in::Int, c_out::Int, activation=relu)
+    weight = randn(Float32, k, c_in, c_out) * 0.1f0
+    bias = zeros(Float32, c_out)
+    Conv1D(k, c_in, c_out, weight, bias, activation)
+end
+
+function (c::Conv1D)(x::Array{Float32, 3})
+    L, C, N = size(x)
+    out_len = L - c.kernel_size + 1
+    result = Array{Float32,3}(undef, out_len, c.out_channels, N)
+    for n in 1:N
+        for oc in 1:c.out_channels
+            for i in 1:out_len
+                region = view(x, i:i+c.kernel_size-1, :, n)
+                result[i, oc, n] = c.activation(sum(region .* c.weight[:, :, oc]) + c.bias[oc])
+            end
+        end
+    end
+    return result
+end
+
+function (p::MaxPool1D)(x::Array{Float32, 3})
+    L, C, N = size(x)
+    stride = p.pool_size
+    out_len = Int(floor(L / stride))
+    result = Array{Float32, 3}(undef, out_len, C, N)
+    for n in 1:N, c in 1:C
+        for i in 1:out_len
+            result[i, c, n] = maximum(view(x, ((i-1)*stride+1):(i*stride), c, n))
+        end
+    end
+    return result
+end
 
 # Define activation functions first
 relu(x) = x > 0 ? x : Float32(0)
@@ -31,12 +124,6 @@ function Adam(lr=Float32(0.001), β1=Float32(0.9), β2=Float32(0.999), ϵ=Float3
     Adam(lr, β1, β2, ϵ, Dict{Any, Tuple{Array{Float32}, Array{Float32}, Int}}())
 end
 
-# Add Dropout layer
-mutable struct Dropout
-    p::Float32
-    is_training::Bool
-end
-
 function Dropout(p=Float32(0.5))
     Dropout(p, true)
 end
@@ -55,18 +142,6 @@ function backward!(d::Dropout, grad_output::Matrix{Float32})
     end
     mask = rand(Float32, size(grad_output)) .> d.p
     return grad_output .* mask ./ (Float32(1) - d.p)
-end
-
-# Then define Dense layer
-mutable struct Dense
-    W::Matrix{Float32}
-    b::Vector{Float32}
-    σ::Function
-    weight_decay::Float32  # Add weight decay parameter
-    # Cache for backward pass
-    last_input::Matrix{Float32}
-    last_output::Matrix{Float32}
-    last_pre_activation::Matrix{Float32}
 end
 
 function Dense(in_dim::Int, out_dim::Int, σ::Function; weight_decay=Float32(0.0001))
@@ -131,19 +206,16 @@ function backward!(d::Dense, grad_output::Matrix{Float32})
     return grad_W, grad_b, grad_input
 end
 
-# Define Chain
-mutable struct Chain
-    layers::Vector{Union{Dense,Dropout,Chain}}  # Add Dropout to supported layers
-    grad_cache::Vector{Any}
-end
-
 # Internal constructor
-function Chain(layers::Vector{Union{Dense,Dropout,Chain}}, grad_cache::Vector{Any})
-    new(layers, grad_cache)
+
+function Chain(layers::Layer...)
+    layer_list = collect(layers)
+    grad_cache = [nothing for _ in layer_list]
+    Chain(layer_list, grad_cache)
 end
 
 # External constructor for varargs
-function Chain(layers::Union{Dense,Dropout,Chain}...)
+function Chain(layers::Any...)
     layers_vec = collect(layers)
     grad_cache = [nothing for _ in layers_vec]
     Chain(layers_vec, grad_cache)
@@ -172,8 +244,14 @@ function backward!(c::Chain, grad_output::Matrix{Float32})
         elseif layer isa Dropout
             grad_output = backward!(layer, grad_output)
             c.grad_cache[i] = nothing
+        elseif layer isa Embedding || layer isa Conv1D || layer isa MaxPool1D
+            # For CNN layers, just pass through the gradient (no parameters to update)
+            c.grad_cache[i] = nothing
+        elseif isa(layer, Function)
+            # For function layers (like permute, flatten, etc.), just pass through
+            c.grad_cache[i] = nothing
         else
-            error("Unsupported layer type for backward pass")
+            error("Unsupported layer type for backward pass: $(typeof(layer))")
         end
     end
     return c.grad_cache
@@ -201,16 +279,31 @@ end
 
 # Modify params to work with new Dense layer
 function params(model)
-    ps = Float32[]
+    ps = []
     if model isa Dense
-        append!(ps, vec(model.W))
-        append!(ps, vec(model.b))
+        push!(ps, model.W)
+        push!(ps, model.b)
     elseif model isa Chain
         for layer in model.layers
             append!(ps, params(layer))
         end
     end
     return ps
+end
+
+function setparams!(model, new_params)
+    idx = 1
+    if model isa Dense
+        model.W .= new_params[idx]; idx += 1
+        model.b .= new_params[idx]; idx += 1
+    elseif model isa Chain
+        for layer in model.layers
+            if layer isa Dense
+                layer.W .= new_params[idx]; idx += 1
+                layer.b .= new_params[idx]; idx += 1
+            end
+        end
+    end
 end
 
 binarycrossentropy(ŷ, y) = AD.binarycrossentropy(ŷ, y)
@@ -224,10 +317,7 @@ end
 
 function DataLoader(data::Tuple{Array{Float32,2},Array{Float32,1}}; batchsize::Int=64, shuffle::Bool=true)
     X, y = data
-    # Ensure X is in the right shape (features × samples)
-    if size(X, 1) < size(X, 2)
-        X = transpose(X)
-    end
+    # Data is already in the correct shape (features × samples), no need to transpose
     if shuffle
         idx = shuffle!(collect(1:size(X, 2)))
         return DataLoader((X[:, idx], y[idx]), batchsize, shuffle)
@@ -261,12 +351,23 @@ function clip_gradients!(grads_cache, threshold::Float32)
     end
 end
 
-
 function loss(model, x, y)
     y_pred = vec(model(x))
     ϵ = Float32(1e-7)
     ŷ = clamp.(y_pred, ϵ, 1f0 - ϵ)
-    return -mean(y .* log.(ŷ) .+ (1f0 .- y) .* log.(1f0 .- ŷ))
+
+    # Binary cross entropy loss
+    bce_loss = -mean(y .* log.(ŷ) .+ (1f0 .- y) .* log.(1f0 .- ŷ))
+
+    # L2 regularization
+    l2_reg = Float32(0.0)
+    for layer in model.layers
+        if layer isa Dense
+            l2_reg += sum(layer.W.^2) + sum(layer.b.^2)
+        end
+    end
+
+    return bce_loss + Float32(0.0001) * l2_reg
 end
 
 function grad(model, x, y)
@@ -276,57 +377,41 @@ function grad(model, x, y)
     return reshape(grad_pred, :, 1)
 end
 
-function train_model(model, dataset, test_X, test_y, opt, epochs, patience)
-    best_val_loss = Inf
-    patience_counter = 0
-    best_model_state = nothing
-    current_model = deepcopy(model)
-
+function train_model(model, dataset, test_X, test_y, opt, epochs)
     for epoch in 1:epochs
-        total_loss = 0.0
-        total_acc = 0.0
-        num_batches = 0
+        total_loss = 0.0f0
+        total_acc = 0.0f0
+        num_samples = 0
 
-        for layer in current_model.layers
-            if layer isa Dropout
-                layer.is_training = true
-            end
-        end
-
-        epoch_time = @elapsed begin
+        t = @elapsed begin
             for (x, y) in dataset
-                loss_val = loss(current_model, x, y)
-                grad_output = grad(current_model, x, y)
-
-                grads_cache = backward!(current_model, reshape(grad_output, :, 1))
-                clip_gradients!(grads_cache, 5.0f0)
-                update!(current_model, grads_cache, opt)
-
-                total_loss += loss_val
-                total_acc += mean((vec(current_model(x)) .> 0.5) .== (y .> 0.5))
-                num_batches += 1
+                # Forward pass
+                y_pred = model(x)
+                # Compute loss
+                current_loss = loss(model, x, y)
+                total_loss += current_loss
+                # Compute accuracy
+                acc = mean((vec(y_pred) .> 0.5) .== (y .> 0.5))
+                total_acc += acc
+                # Backward pass - compute gradients
+                grad_output = grad(model, x, y)
+                grads_cache = backward!(model, grad_output)
+                # Clip gradients to prevent exploding gradients
+                clip_gradients!(grads_cache, Float32(1.0))
+                # Update parameters
+                update!(model, grads_cache, opt)
+                num_samples += 1
             end
         end
 
-        for layer in current_model.layers
-            if layer isa Dropout
-                layer.is_training = false
-            end
-        end
+        train_loss = total_loss / num_samples
+        train_acc = total_acc / num_samples
+        test_acc = mean((vec(model(test_X)) .> 0.5) .== (test_y .> 0.5))
+        test_loss = loss(model, test_X, test_y)
 
-        train_loss = total_loss / num_batches
-        train_acc = total_acc / num_batches
-
-        ŷ_test = vec(current_model(test_X))
-        ϵ = Float32(1e-7)
-        ŷ_clamped = clamp.(ŷ_test, ϵ, 1f0 - ϵ)
-        test_loss = -mean(test_y .* log.(ŷ_clamped) .+ (1f0 .- test_y) .* log.(1f0 .- ŷ_clamped))
-        test_acc = mean((ŷ_test .> 0.5) .== (test_y .> 0.5))
-
-        @printf "Epoch: %-2d (%.2fs)   Train: (l: %.4f, a: %.4f)   Test: (l: %.4f, a: %.4f)\n" epoch epoch_time train_loss train_acc test_loss test_acc
+        println(@sprintf("Epoch: %d  (%.2fs)   Train: (l: %.4f, a: %.4f)   Test: (l: %.4f, a: %.4f)",
+            epoch, t, train_loss, train_acc, test_loss, test_acc))
     end
-
-    return current_model
 end
 
 end # module

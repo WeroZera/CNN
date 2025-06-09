@@ -1,6 +1,6 @@
 module AD
 
-export ADValue, grad, unwrap
+export ADValue, grad, unwrap, binarycrossentropy
 
 import Base: +, -, *, /, zero, one, sum, exp, clamp
 
@@ -55,11 +55,19 @@ import Base: copy
 function copy(x::ADValue)
     ADValue(x.value, x.grad)
 end
+
 # Funkcja sigmoid
 function sigmoid(x::ADValue)
     sig = 1 / (1 + exp(-x))
     # pochodna sigmoid(x) = sigmoid(x)*(1-sigmoid(x))
     return sig
+end
+
+# Binary cross entropy function
+function binarycrossentropy(ŷ, y)
+    ϵ = 1e-7
+    ŷ_clamped = clamp.(ŷ, ϵ, 1.0 - ϵ)
+    return -mean(y .* log.(ŷ_clamped) .+ (1.0 .- y) .* log.(1.0 .- ŷ_clamped))
 end
 
 import Base: size
@@ -72,7 +80,7 @@ length(x::ADValue) = 1
 function grad(f, params)
     # Zamieniamy wszystkie parametry na ADValue, liczymy pochodną po każdym z nich
     orig_params = [copy(p) for p in params]
-    grads = [zeros(size(p)) for p in params]
+    grads = [zeros(Float64, size(p)) for p in params]
     l = 0.0
 
     for i in eachindex(params)
@@ -98,7 +106,7 @@ function grad(f, params)
         else
             # Handle array case
             sz = size(p)
-            g = zeros(sz)
+            g = zeros(Float64, sz)
             for idx in CartesianIndices(sz)
                 ad_params = [copy(x) for x in params]
                 ad_params[i][idx] = ADValue(p[idx], 1.0)
@@ -111,12 +119,12 @@ function grad(f, params)
                         end
                     end
                 end
-            lval = f(ad_params...)
-            g[idx] = lval.grad
-            if i == 1 && idx == CartesianIndex((ones(Int, ndims(p)))...)
-                l = lval.value
+                lval = f(ad_params...)
+                g[idx] = lval.grad
+                if i == 1 && idx == CartesianIndex((ones(Int, ndims(p)))...)
+                    l = lval.value
+                end
             end
-        end
             grads[i] = g
         end
     end
