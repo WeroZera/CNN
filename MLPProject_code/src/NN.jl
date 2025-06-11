@@ -5,6 +5,7 @@ using Random
 using LinearAlgebra
 using Statistics
 using Printf
+using Distributions
 
 export Dense, Chain, relu, sigmoid, softmax, binarycrossentropy, params, update!,
        DataLoader, Adam, Dropout, clip_gradients!, train_model,
@@ -81,7 +82,8 @@ function (e::Embedding)(x::AbstractArray{Int})
 end
 
 function Conv1D(k::Int, c_in::Int, c_out::Int, activation=relu)
-    weight = randn(Float32, k, c_in, c_out) * Float32(0.1)
+    xavier = sqrt(6 / (k * c_in + c_out))
+    weight = rand(Uniform(-xavier, xavier), k, c_in, c_out)
     bias = zeros(Float32, c_out)
     last_input = Array{Float32}(undef, 0, 0, 0)
     last_output = Array{Float32}(undef, 0, 0, 0)
@@ -209,27 +211,26 @@ end
 
 
 function backward!(e::Embedding, grad_output::Array{Float32, 2})
-    # grad_output ma wymiary (embedding_dim, batch_size)
     grad_weight = zeros(Float32, size(e.weight))  # (embedding_dim, vocab_size)
 
-    # Check if dimensions match
-    expected_grad_cols = length(e.last_indices)
-    if size(grad_output, 2) != expected_grad_cols
-        error("Embedding backward: grad_output has $(size(grad_output, 2)) columns but expected $expected_grad_cols")
+    counts = Dict{Int, Int}()
+
+    # Sumujemy gradienty
+    for (i, idx) in enumerate(e.last_indices)
+        grad_weight[:, idx] .+= grad_output[:, i]
+        counts[idx] = get(counts, idx, 0) + 1
     end
 
-    # Dla każdego indeksu w last_indices dodaj gradient
-    for (i, idx) in enumerate(e.last_indices)
-        if idx <= size(grad_weight, 2)
-            grad_weight[:, idx] .+= grad_output[:, i]
-        else
-            error("Embedding backward: index $idx exceeds vocabulary size $(size(grad_weight, 2))")
+    # Uśredniamy gradienty dla indeksów, które wystąpiły więcej niż raz
+    for (idx, count) in counts
+        if count > 1
+            grad_weight[:, idx] ./= count
         end
     end
 
-    # Return both gradient and used indices for the update function
     return grad_weight, unique(e.last_indices)
 end
+
 
 function backward!(c::Conv1D, grad_output::Array{Float32,3})
     x = c.last_input
@@ -260,7 +261,8 @@ end
 
 function Dense(in_dim::Int, out_dim::Int, σ::Function; weight_decay=Float32(0.0001))
     # Initialize with He initialization
-    W = Float32.(randn(out_dim, in_dim) .* sqrt(2 / in_dim))
+    xavier = sqrt(6 / (in_dim + out_dim))
+    W = rand(Uniform(-xavier, xavier), out_dim, in_dim)
     b = zeros(Float32, out_dim)
 
     # Initialize cache
@@ -375,14 +377,9 @@ function backward!(c::Chain, grad_output::Matrix{Float32})
             grad_W, grad_b, grad_output = backward!(layer, grad_output)
             c.grad_cache[i] = (grad_W, grad_b)
         elseif layer isa Embedding
-            # For Embedding, we need to handle the gradient properly
-            # The gradient should be reshaped to match the embedding output
             if ndims(grad_output) == 3
-                # The gradient should be (embedding_dim, sequence_length, batch_size)
-                # But it's currently (sequence_length, embedding_dim, batch_size) after permute reversal
-                # We need to reshape it to (embedding_dim, sequence_length * batch_size)
-                embedding_dim = size(grad_output, 2)  # This is the embedding dimension after permute
-                total_elements = size(grad_output, 1) * size(grad_output, 3)  # sequence_length * batch_size
+                embedding_dim = size(grad_output, 2)  
+                total_elements = size(grad_output, 1) * size(grad_output, 3) 
                 grad_output = reshape(grad_output, embedding_dim, total_elements)
             end
             grad_weight, used_indices = backward!(layer, grad_output)
@@ -392,10 +389,7 @@ function backward!(c::Chain, grad_output::Matrix{Float32})
             grad_output = backward!(layer, grad_output)
             c.grad_cache[i] = nothing
         elseif isa(layer, Function)
-            # For function layers (like permute, flatten, etc.), handle appropriately
             if layer == flatten
-                # For flatten, we need to reshape the gradient back to 3D
-                # Use the stored shape from the previous layer
                 if i > 1 && c.shape_cache[i-1] !== nothing
                     grad_output = reshape(grad_output, c.shape_cache[i-1])
                 else
@@ -460,8 +454,7 @@ function update!(model::Chain, grads_cache, opt::Adam)
             for idx in used_indices
                 param_row = view(layer.weight, :, idx)
                 grad_row = view(grad_weight, :, idx)
-
-                # Use a stable key per row
+               
                 key = (objectid(layer.weight), idx)
                 m, v, t = get!(opt.state, key, (zeros(Float32, size(param_row)), zeros(Float32, size(param_row)), 0))
                 t += 1
@@ -541,7 +534,6 @@ end
 function clip_gradients!(grads, clip_value=Float32(1.0))
     for grad in grads
         if grad !== nothing
-            # Only clip if both elements are arrays of Float32 (Dense/Conv1D)
             if isa(grad, Tuple) && length(grad) == 2 &&
                isa(grad[1], AbstractArray{Float32}) && isa(grad[2], AbstractArray{Float32})
                 gW, gb = grad
@@ -590,6 +582,7 @@ function train_model(model, dataset, test_X, test_y, opt, epochs)
 
         t = @elapsed begin
             for (x, y) in dataset
+               
                 # Forward pass
                 y_pred = model(x)
 
@@ -602,7 +595,7 @@ function train_model(model, dataset, test_X, test_y, opt, epochs)
                 grads_cache = backward!(model, grad_output)
 
                 # Clip gradients to prevent exploding gradients
-                clip_gradients!(grads_cache, Float32(1.0))
+                #clip_gradients!(grads_cache, Float32(1.0))
 
                 # Update parameters
                 update!(model, grads_cache, opt)
