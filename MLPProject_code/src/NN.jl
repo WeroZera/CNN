@@ -28,6 +28,7 @@ end
 mutable struct Dropout
     p::Float32
     is_training::Bool
+    mask::AbstractArray{Bool}
 end
 
 # Define Chain
@@ -40,6 +41,7 @@ mutable struct Embedding
     vocab_size::Int
     embedding_dim::Int
     weight::Array{Float32, 2}
+    last_indices::Vector{Int}
 end
 
 mutable struct Conv1D
@@ -61,33 +63,45 @@ const Layer = Union{Dense, Dropout, Chain, Embedding, Conv1D, MaxPool1D, typeof(
 
 # CNN Components
 
+
 function Embedding(vocab_size::Int, embedding_dim::Int, weights::Array{<:Real,2})
-    Embedding(vocab_size, embedding_dim, Float32.(weights))
+    Embedding(vocab_size, embedding_dim, Float32.(weights), Int[])
 end
 
-function (e::Embedding)(x::AbstractArray)
-    return e.weight[:, x]
+function (e::Embedding)(x::AbstractArray{Int})
+    inds = vec(x)  # flatten for indexing
+    e.last_indices = inds
+    emb = e.weight[:, inds]
+    return reshape(emb, e.embedding_dim, size(x)...)
 end
+
 
 function Conv1D(k::Int, c_in::Int, c_out::Int, activation=relu)
-    weight = randn(Float32, k, c_in, c_out) * 0.1f0
+    weight = randn(Float32, k, c_in, c_out) * Float32(0.1)
     bias = zeros(Float32, c_out)
     Conv1D(k, c_in, c_out, weight, bias, activation)
 end
 
 function (c::Conv1D)(x::Array{Float32, 3})
     L, C, N = size(x)
-    out_len = L - c.kernel_size + 1
-    result = Array{Float32,3}(undef, out_len, c.out_channels, N)
+    k = c.kernel_size
+    out_len = L - k + 1
+    y = Array{Float32}(undef, out_len, c.out_channels, N)
+
+    kernels = reshape(c.weight, k * C, c.out_channels)
+
     for n in 1:N
-        for oc in 1:c.out_channels
-            for i in 1:out_len
-                region = view(x, i:i+c.kernel_size-1, :, n)
-                result[i, oc, n] = c.activation(sum(region .* c.weight[:, :, oc]) + c.bias[oc])
-            end
+        col = Array{Float32}(undef, k * C, out_len)
+        for i in 1:out_len
+            patch = x[i:i+k-1, :, n]
+            col[:, i] = reshape(patch, k * C)
         end
+        z = kernels' * col  # shape: (out_channels, out_len)
+        z .+= c.bias[:, :]  # add bias to each channel
+        y[:, :, n] .= c.activation.(z')  # z' -> (out_len, out_channels)
     end
-    return result
+
+    return y
 end
 
 function (p::MaxPool1D)(x::Array{Float32, 3})
@@ -125,24 +139,41 @@ function Adam(lr=Float32(0.001), β1=Float32(0.9), β2=Float32(0.999), ϵ=Float3
 end
 
 function Dropout(p=Float32(0.5))
-    Dropout(p, true)
+    Dropout(p, true, BitArray(undef, 0))
 end
 
 function (d::Dropout)(x::AbstractArray)
-    if !d.is_training
+    if d.is_training
+        T = eltype(x)  # get the element type of x (e.g., Float32)
+        d.mask = rand(T, size(x)) .>= T(d.p)  # generate mask with correct type
+        return x .* d.mask ./ (T(1.0) - T(d.p))  # scale to preserve expectation
+    else
         return x
     end
-    mask = rand(Float32, size(x)) .> d.p
-    return x .* mask ./ (Float32(1) - d.p)
 end
 
-function backward!(d::Dropout, grad_output::Matrix{Float32})
-    if !d.is_training
+
+function backward!(d::Dropout, grad_output::AbstractArray)
+    if d.is_training
+        return grad_output .* d.mask ./ (Float32(1.0) - d.p)
+    else
         return grad_output
     end
-    mask = rand(Float32, size(grad_output)) .> d.p
-    return grad_output .* mask ./ (Float32(1) - d.p)
 end
+
+
+function backward!(e::Embedding, grad_output::Array{Float32, 2})
+    # grad_output ma wymiary (embedding_dim, batch_size)
+    grad_weight = zeros(Float32, size(e.weight))  # (embedding_dim, vocab_size)
+
+    # Dla każdego indeksu w last_indices dodaj gradient
+    for (i, idx) in enumerate(e.last_indices)
+        grad_weight[:, idx] .+= grad_output[:, i]
+    end
+
+    return grad_weight
+end
+
 
 function Dense(in_dim::Int, out_dim::Int, σ::Function; weight_decay=Float32(0.0001))
     # Initialize with He initialization
@@ -257,25 +288,50 @@ function backward!(c::Chain, grad_output::Matrix{Float32})
     return c.grad_cache
 end
 
-# Update parameters using computed gradients
 function update!(model::Chain, grads_cache, opt::Adam)
     for (i, layer) in enumerate(model.layers)
-        if layer isa Dense && grads_cache[i] !== nothing
-            grad_W, grad_b = grads_cache[i]
+        grads = grads_cache[i]
+        if grads === nothing
+            continue
+        end
 
+        if layer isa Dense
+            grad_W, grad_b = grads
             for (param, grad) in zip((layer.W, layer.b), (grad_W, grad_b))
-                m, v, t = get!(opt.state, param, (zeros(Float32, size(param)), zeros(Float32, size(param)), 0))
+                key = objectid(param)
+                m, v, t = get!(opt.state, key, (zeros(Float32, size(param)), zeros(Float32, size(param)), 0))
                 t += 1
-                m .= opt.β1 .* m .+ (Float32(1.0) - opt.β1) .* grad
-                v .= opt.β2 .* v .+ (Float32(1.0) - opt.β2) .* (grad .^ 2)
-                m̂ = m ./ (Float32(1.0) - opt.β1^t)
-                ṽ = v ./ (Float32(1.0) - opt.β2^t)
+                m .= opt.β1 .* m .+ (1 - opt.β1) .* grad
+                v .= opt.β2 .* v .+ (1 - opt.β2) .* (grad .^ 2)
+                m̂ = m ./ (1 - opt.β1^t + Float32(1e-8))
+                ṽ = v ./ (1 - opt.β2^t + Float32(1e-8))
                 param .-= opt.lr .* m̂ ./ (sqrt.(ṽ) .+ opt.ϵ)
-                opt.state[param] = (m, v, t)
+                opt.state[key] = (m, v, t)
+            end
+
+        elseif layer isa Embedding
+            grad_weight, used_indices = grads
+
+            for idx in used_indices
+                param_row = view(layer.weight, :, idx)
+                grad_row = view(grad_weight, :, idx)
+
+                # Use a stable key per row
+                key = (objectid(layer.weight), idx)
+                m, v, t = get!(opt.state, key, (zeros(Float32, size(param_row)), zeros(Float32, size(param_row)), 0))
+                t += 1
+                m .= opt.β1 .* m .+ (1 - opt.β1) .* grad_row
+                v .= opt.β2 .* v .+ (1 - opt.β2) .* (grad_row .^ 2)
+                m̂ = m ./ (1 - opt.β1^t + Float32(1e-8))
+                ṽ = v ./ (1 - opt.β2^t + Float32(1e-8))
+                param_row .-= opt.lr .* m̂ ./ (sqrt.(ṽ) .+ opt.ϵ)
+                opt.state[key] = (m, v, t)
             end
         end
     end
 end
+
+
 
 # Modify params to work with new Dense layer
 function params(model)
@@ -336,16 +392,15 @@ function Base.iterate(dl::DataLoader, state=1)
     return batch, state + dl.batchsize
 end
 
-function clip_gradients!(grads_cache, threshold::Float32)
-    for i in 1:length(grads_cache)
-        if grads_cache[i] !== nothing
-            grad_W, grad_b = grads_cache[i]
-            norm = sqrt(sum(grad_W.^2) + sum(grad_b.^2))
-            if norm > threshold
-                scaling = threshold / norm
-                grad_W .*= scaling
-                grad_b .*= scaling
-                grads_cache[i] = (grad_W, grad_b)
+function clip_gradients!(grads, clip_value=Float32(1.0))
+    for grad in grads
+        if grad !== nothing
+            gW, gb = grad
+            norm = sqrt(sum(gW.^2) + sum(gb.^2))
+            if norm > clip_value
+                scale = clip_value / (norm + Float32(1e-6))
+                gW .*= scale
+                gb .*= scale
             end
         end
     end
@@ -354,10 +409,10 @@ end
 function loss(model, x, y)
     y_pred = vec(model(x))
     ϵ = Float32(1e-7)
-    ŷ = clamp.(y_pred, ϵ, 1f0 - ϵ)
+    ŷ = clamp.(y_pred, ϵ, Float32(1.0) - ϵ)
 
     # Binary cross entropy loss
-    bce_loss = -mean(y .* log.(ŷ) .+ (1f0 .- y) .* log.(1f0 .- ŷ))
+    bce_loss = -mean(y .* log.(ŷ) .+ (Float32(1.0) .- y) .* log.(Float32(1.0) .- ŷ))
 
     # L2 regularization
     l2_reg = Float32(0.0)
@@ -372,21 +427,22 @@ end
 
 function grad(model, x, y)
     y_pred = vec(model(x))
-    grad_pred = (y_pred .- y) ./ (y_pred .* (1f0 .- y_pred))
+    grad_pred = (y_pred .- y) ./ (y_pred .* (Float32(1.0) .- y_pred))
     grad_pred ./= length(y)
     return reshape(grad_pred, :, 1)
 end
 
 function train_model(model, dataset, test_X, test_y, opt, epochs)
     for epoch in 1:epochs
-        total_loss = 0.0f0
-        total_acc = 0.0f0
+        total_loss = Float32(0.0) # Or zero(Float32)
+        total_acc = Float32(0.0)  # Or zero(Float32)
         num_samples = 0
 
         t = @elapsed begin
             for (x, y) in dataset
                 # Forward pass
                 y_pred = model(x)
+
                 # Compute loss
                 current_loss = loss(model, x, y)
                 total_loss += current_loss
