@@ -105,7 +105,7 @@ function (c::Conv1D)(x::Array{Float32, 3})
             patch = x[i:i+k-1, :, n]
             col[:, i] = reshape(patch, k * C)
         end
-        z = kernels' * col  # shape: (out_channels, out_len)
+        z = kernels' * col  
         z .+= c.bias[:, :]  # add bias to each channel
         y[:, :, n] .= c.activation.(z')  # z' -> (out_len, out_channels)
     end
@@ -507,29 +507,32 @@ struct DataLoader
     data::Tuple{Array{Float32,2}, Array{Float32,1}}
     batchsize::Int
     shuffle::Bool
+    indices::Vector{Int}
 end
 
-function DataLoader(data::Tuple{Array{Float32,2},Array{Float32,1}}; batchsize::Int=64, shuffle::Bool=true)
+function DataLoader(data::Tuple{Array{Float32,2}, Array{Float32,1}}; batchsize::Int=64, shuffle::Bool=true)
     X, y = data
-    # Data is already in the correct shape (features × samples), no need to transpose
-    if shuffle
-        idx = shuffle!(collect(1:size(X, 2)))
-        return DataLoader((X[:, idx], y[idx]), batchsize, shuffle)
-    end
-    return DataLoader(data, batchsize, shuffle)
+    @assert size(X, 2) == length(y) "Mismatched number of samples in X and y"
+    idx = shuffle ? randperm(size(X, 2)) : collect(1:size(X, 2))
+    return DataLoader(data, batchsize, shuffle, idx)
 end
 
-function Base.iterate(dl::DataLoader, state=1)
-    if state > size(dl.data[1], 2)
+function Base.iterate(dl::DataLoader, state::Int=1)
+    if state > length(dl.indices)
         return nothing
     end
 
-    end_idx = min(state + dl.batchsize - 1, size(dl.data[1], 2))
-    batch = (dl.data[1][:, state:end_idx],
-             dl.data[2][state:end_idx])
+    end_idx = min(state + dl.batchsize - 1, length(dl.indices))
+    batch_indices = dl.indices[state:end_idx]
 
-    return batch, state + dl.batchsize
+    X, y = dl.data
+    batch_X = X[:, batch_indices]
+    batch_y = y[batch_indices]
+
+    return (batch_X, batch_y), end_idx + 1
 end
+
+Base.length(dl::DataLoader) = cld(length(dl.indices), dl.batchsize)
 
 function clip_gradients!(grads, clip_value=Float32(1.0))
     for grad in grads
