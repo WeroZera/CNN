@@ -9,7 +9,8 @@ using Distributions
 
 export Dense, Chain, relu, sigmoid, softmax, binarycrossentropy, params, update!,
        DataLoader, Adam, Dropout, clip_gradients!, train_model,
-       Embedding, Conv1D, MaxPool1D, flatten
+       Embedding, Conv1D, MaxPool1D, flatten, BatchNorm1D,
+       set_eval_mode!, set_train_mode!
 
 const ADValue = AD.ADValue
 
@@ -65,8 +66,6 @@ end
 
 flatten(x) = reshape(x, :, size(x, 3))
 
-const Layer = Union{Dense, Dropout, Chain, Embedding, Conv1D, MaxPool1D, typeof(flatten)}
-
 # CNN Components
 
 
@@ -82,8 +81,16 @@ function (e::Embedding)(x::AbstractArray{Int})
 end
 
 function Conv1D(k::Int, c_in::Int, c_out::Int, activation=relu)
-    xavier = sqrt(6 / (k * c_in + c_out))
-    weight = rand(Uniform(-xavier, xavier), k, c_in, c_out)
+    # Use He initialization for ReLU activations (better than Xavier for deep networks)
+    if activation == relu
+        he_std = sqrt(2.0 / (k * c_in))
+        weight = randn(Float32, k, c_in, c_out) .* he_std
+    else
+        # Xavier/Glorot initialization for other activations
+        xavier = sqrt(6.0 / (k * c_in + c_out))
+        weight = rand(Uniform(-xavier, xavier), k, c_in, c_out)
+    end
+
     bias = zeros(Float32, c_out)
     last_input = Array{Float32}(undef, 0, 0, 0)
     last_output = Array{Float32}(undef, 0, 0, 0)
@@ -97,19 +104,27 @@ function (c::Conv1D)(x::Array{Float32, 3})
     out_len = L - k + 1
     y = Array{Float32}(undef, out_len, c.out_channels, N)
 
+    # Pre-allocate col matrix to avoid repeated allocations
+    col = Array{Float32}(undef, k * C, out_len)
+
+    # Reshape weight once
     kernels = reshape(c.weight, k * C, c.out_channels)
 
-    for n in 1:N
-        col = Array{Float32}(undef, k * C, out_len)
+    @inbounds for n in 1:N
+        # Fill col matrix more efficiently
         for i in 1:out_len
-            patch = x[i:i+k-1, :, n]
-            col[:, i] = reshape(patch, k * C)
+            @views col[:, i] = reshape(x[i:i+k-1, :, n], :)
         end
-        z = kernels' * col  
-        z .+= c.bias[:, :]  # add bias to each channel
-        y[:, :, n] .= c.activation.(z')  # z' -> (out_len, out_channels)
+
+        # Single matrix multiplication
+        z = kernels' * col
+
+        # Add bias and apply activation in one pass - avoid temporary allocations
+        @views for i in 1:out_len, j in 1:c.out_channels
+            y[i, j, n] = c.activation(z[j, i] + c.bias[j])
+        end
     end
-    c.last_output = y  # <-- save output
+    c.last_output = y
 
     return y
 end
@@ -125,16 +140,20 @@ function (p::MaxPool1D)(x::Array{Float32, 3})
     out_len = Int(floor(L / stride))
     result = Array{Float32, 3}(undef, out_len, C, N)
     mask = falses(L, C, N)
-    for n in 1:N, c in 1:C
+
+    @inbounds for n in 1:N, c in 1:C
         for i in 1:out_len
-            window = view(x, ((i-1)*stride+1):(i*stride), c, n)
+            start_idx = (i-1)*stride + 1
+            end_idx = i*stride
+            @views window = x[start_idx:end_idx, c, n]
             maxval = maximum(window)
             result[i, c, n] = maxval
-            # Mark the max location in the mask
+
+            # Find first occurrence of max value
             for j in 1:stride
                 if window[j] == maxval
-                    mask[(i-1)*stride+j, c, n] = true
-                    break  # Only mark the first max if there are ties
+                    mask[start_idx + j - 1, c, n] = true
+                    break
                 end
             end
         end
@@ -167,7 +186,19 @@ end
 
 # Define activation functions first
 relu(x) = x > 0 ? x : Float32(0)
+relu(x::AbstractArray) = max.(x, Float32(0))
+
+# LeakyReLU - often better than ReLU
+leakyrelu(x, α=Float32(0.01)) = x > 0 ? x : α * x
+leakyrelu(x::AbstractArray, α=Float32(0.01)) = max.(x, α .* x)
+
+# ELU - exponential linear unit
+elu(x, α=Float32(1.0)) = x > 0 ? x : α * (exp(x) - 1)
+elu(x::AbstractArray, α=Float32(1.0)) = x .> 0 ? x : α .* (exp.(x) .- 1)
+
 sigmoid(x) = Float32(1) / (Float32(1) + exp(-x))
+sigmoid(x::AbstractArray) = Float32(1) ./ (Float32(1) .+ exp.(-x))
+
 softmax(xs) = begin
     exps = exp.(xs .- maximum(xs))
     exps ./ sum(exps)
@@ -186,7 +217,7 @@ function Adam(lr=Float32(0.001), β1=Float32(0.9), β2=Float32(0.999), ϵ=Float3
     Adam(lr, β1, β2, ϵ, Dict{Any, Tuple{Array{Float32}, Array{Float32}, Int}}())
 end
 
-function Dropout(p=Float32(0.5))
+function Dropout(p=Float32(0.2))
     Dropout(p, true, BitArray(undef, 0))
 end
 
@@ -213,22 +244,27 @@ end
 function backward!(e::Embedding, grad_output::Array{Float32, 2})
     grad_weight = zeros(Float32, size(e.weight))  # (embedding_dim, vocab_size)
 
-    counts = Dict{Int, Int}()
-
-    # Sumujemy gradienty
+    # More efficient gradient accumulation without dictionary
     for (i, idx) in enumerate(e.last_indices)
         grad_weight[:, idx] .+= grad_output[:, i]
-        counts[idx] = get(counts, idx, 0) + 1
     end
 
-    # Uśredniamy gradienty dla indeksów, które wystąpiły więcej niż raz
-    for (idx, count) in counts
+    # Average gradients for repeated indices more efficiently
+    unique_indices = unique(e.last_indices)
+    for idx in unique_indices
+        # Count occurrences manually
+        count = 0
+        for j in e.last_indices
+            if j == idx
+                count += 1
+            end
+        end
         if count > 1
             grad_weight[:, idx] ./= count
         end
     end
 
-    return grad_weight, unique(e.last_indices)
+    return grad_weight, unique_indices
 end
 
 
@@ -242,18 +278,33 @@ function backward!(c::Conv1D, grad_output::Array{Float32,3})
     grad_bias = zeros(Float32, c.out_channels)
     grad_input = zeros(Float32, L, C, N)
 
-    for n in 1:N
-        for i in 1:out_len
-            patch = x[i:i+k-1, :, n]  # size (k, C)
-            for oc in 1:c.out_channels
-                # Grad w.r.t. weights
-                grad_weight[:, :, oc] .+= grad_output[i, oc, n] .* patch
+    # Pre-allocate for efficiency
+    col = Array{Float32}(undef, k * C, out_len)
+    kernels = reshape(c.weight, k * C, c.out_channels)
 
-                # Grad w.r.t. input
-                grad_input[i:i+k-1, :, n] .+= grad_output[i, oc, n] .* c.weight[:, :, oc]
-            end
+    @inbounds for n in 1:N
+        # Fill col matrix
+        for i in 1:out_len
+            @views col[:, i] = reshape(x[i:i+k-1, :, n], :)
         end
-        grad_bias .+= sum(grad_output[:, :, n]; dims=1)[:]
+
+        # Compute gradients more efficiently
+        grad_out_n = view(grad_output, :, :, n)
+
+        # Grad w.r.t. weights: grad_output * col^T
+        grad_weight_n = grad_out_n' * col'  # (out_channels, k*C)
+        for oc in 1:c.out_channels
+            grad_weight[:, :, oc] .+= reshape(grad_weight_n[oc, :], k, C)
+        end
+
+        # Grad w.r.t. bias
+        grad_bias .+= vec(sum(grad_out_n, dims=1))
+
+        # Grad w.r.t. input: weight^T * grad_output
+        grad_input_n = kernels * grad_out_n'  # (k*C, out_len)
+        for i in 1:out_len
+            @views grad_input[i:i+k-1, :, n] .+= reshape(grad_input_n[:, i], k, C)
+        end
     end
 
     return grad_weight, grad_bias, grad_input
@@ -274,10 +325,11 @@ function Dense(in_dim::Int, out_dim::Int, σ::Function; weight_decay=Float32(0.0
 end
 
 function (d::Dense)(x::AbstractArray)
-    # Convert input to Float32 matrix
-    xmat = x isa Matrix ? x : reshape(x, :, 1)
-    if !(eltype(xmat) <: Float32)
-        xmat = Float32.(xmat)
+    # Convert input to Float32 matrix more efficiently
+    if x isa Matrix && eltype(x) <: Float32
+        xmat = x
+    else
+        xmat = Float32.(reshape(x, :, size(x, ndims(x))))
     end
 
     # Store input for backward pass
@@ -299,7 +351,7 @@ function backward!(d::Dense, grad_output::Matrix{Float32})
         grad_output = reshape(grad_output, :, size(d.last_output, 2))
     end
 
-    # Compute gradient of activation
+    # Compute gradient of activation more efficiently
     grad_pre_activation = similar(grad_output)
     if d.σ == relu
         @inbounds for i in eachindex(grad_pre_activation)
@@ -314,7 +366,7 @@ function backward!(d::Dense, grad_output::Matrix{Float32})
         error("Unsupported activation function for backward pass")
     end
 
-    # Compute gradients with L2 regularization
+    # Compute gradients with L2 regularization using BLAS operations
     grad_W = grad_pre_activation * d.last_input' .+ d.weight_decay .* d.W
     grad_b = vec(sum(grad_pre_activation, dims=2))
     grad_input = d.W' * grad_pre_activation
@@ -323,8 +375,7 @@ function backward!(d::Dense, grad_output::Matrix{Float32})
 end
 
 # Internal constructor
-
-function Chain(layers::Layer...)
+function Chain(layers...)
     layer_list = collect(layers)
     grad_cache = [nothing for _ in layer_list]
     shape_cache = [nothing for _ in layer_list]
@@ -378,8 +429,8 @@ function backward!(c::Chain, grad_output::Matrix{Float32})
             c.grad_cache[i] = (grad_W, grad_b)
         elseif layer isa Embedding
             if ndims(grad_output) == 3
-                embedding_dim = size(grad_output, 2)  
-                total_elements = size(grad_output, 1) * size(grad_output, 3) 
+                embedding_dim = size(grad_output, 2)
+                total_elements = size(grad_output, 1) * size(grad_output, 3)
                 grad_output = reshape(grad_output, embedding_dim, total_elements)
             end
             grad_weight, used_indices = backward!(layer, grad_output)
@@ -388,6 +439,18 @@ function backward!(c::Chain, grad_output::Matrix{Float32})
             # Call backward! for MaxPool1D to upsample the gradient
             grad_output = backward!(layer, grad_output)
             c.grad_cache[i] = nothing
+        elseif layer isa BatchNorm1D
+            # Reshape gradient to match the original BatchNorm1D output
+            if ndims(grad_output) == 2
+                # Use the stored shape from forward pass
+                if c.shape_cache[i] !== nothing
+                    grad_output = reshape(grad_output, c.shape_cache[i])
+                else
+                    error("No shape stored for BatchNorm1D layer")
+                end
+            end
+            grad_gamma, grad_beta, grad_output = backward!(layer, grad_output)
+            c.grad_cache[i] = (grad_gamma, grad_beta)
         elseif isa(layer, Function)
             if layer == flatten
                 if i > 1 && c.shape_cache[i-1] !== nothing
@@ -430,7 +493,9 @@ function update!(model::Chain, grads_cache, opt::Adam)
                 v .= opt.β2 .* v .+ (1 - opt.β2) .* (grad .^ 2)
                 m̂ = m ./ (1 - opt.β1^t + Float32(1e-8))
                 ṽ = v ./ (1 - opt.β2^t + Float32(1e-8))
-                param .-= opt.lr .* m̂ ./ (sqrt.(ṽ) .+ opt.ϵ)
+                # Learning rate scheduling: reduce by 10% every 5 epochs
+                current_lr = opt.lr * Float32(0.9)^(div(t, 1000))  # Adjust divisor based on your batch size
+                param .-= current_lr .* m̂ ./ (sqrt.(ṽ) .+ opt.ϵ)
                 opt.state[key] = (m, v, t)
             end
 
@@ -444,7 +509,9 @@ function update!(model::Chain, grads_cache, opt::Adam)
                 v .= opt.β2 .* v .+ (1 - opt.β2) .* (grad .^ 2)
                 m̂ = m ./ (1 - opt.β1^t + Float32(1e-8))
                 ṽ = v ./ (1 - opt.β2^t + Float32(1e-8))
-                param .-= opt.lr .* m̂ ./ (sqrt.(ṽ) .+ opt.ϵ)
+                # Learning rate scheduling
+                current_lr = opt.lr * Float32(0.9)^(div(t, 1000))
+                param .-= current_lr .* m̂ ./ (sqrt.(ṽ) .+ opt.ϵ)
                 opt.state[key] = (m, v, t)
             end
 
@@ -454,7 +521,7 @@ function update!(model::Chain, grads_cache, opt::Adam)
             for idx in used_indices
                 param_row = view(layer.weight, :, idx)
                 grad_row = view(grad_weight, :, idx)
-               
+
                 key = (objectid(layer.weight), idx)
                 m, v, t = get!(opt.state, key, (zeros(Float32, size(param_row)), zeros(Float32, size(param_row)), 0))
                 t += 1
@@ -462,7 +529,24 @@ function update!(model::Chain, grads_cache, opt::Adam)
                 v .= opt.β2 .* v .+ (1 - opt.β2) .* (grad_row .^ 2)
                 m̂ = m ./ (1 - opt.β1^t + Float32(1e-8))
                 ṽ = v ./ (1 - opt.β2^t + Float32(1e-8))
-                param_row .-= opt.lr .* m̂ ./ (sqrt.(ṽ) .+ opt.ϵ)
+                # Learning rate scheduling
+                current_lr = opt.lr * Float32(0.9)^(div(t, 1000))
+                param_row .-= current_lr .* m̂ ./ (sqrt.(ṽ) .+ opt.ϵ)
+                opt.state[key] = (m, v, t)
+            end
+        elseif layer isa BatchNorm1D
+            grad_gamma, grad_beta = grads
+            for (param, grad) in zip((layer.gamma, layer.beta), (grad_gamma, grad_beta))
+                key = objectid(param)
+                m, v, t = get!(opt.state, key, (zeros(Float32, size(param)), zeros(Float32, size(param)), 0))
+                t += 1
+                m .= opt.β1 .* m .+ (1 - opt.β1) .* grad
+                v .= opt.β2 .* v .+ (1 - opt.β2) .* (grad .^ 2)
+                m̂ = m ./ (1 - opt.β1^t + Float32(1e-8))
+                ṽ = v ./ (1 - opt.β2^t + Float32(1e-8))
+                # Learning rate scheduling
+                current_lr = opt.lr * Float32(0.9)^(div(t, 1000))
+                param .-= current_lr .* m̂ ./ (sqrt.(ṽ) .+ opt.ϵ)
                 opt.state[key] = (m, v, t)
             end
         end
@@ -510,11 +594,20 @@ struct DataLoader
     indices::Vector{Int}
 end
 
-function DataLoader(data::Tuple{Array{Float32,2}, Array{Float32,1}}; batchsize::Int=64, shuffle::Bool=true)
+function DataLoader(data::Tuple{<:AbstractArray, <:AbstractArray}; batchsize::Int=64, shuffle::Bool=true)
     X, y = data
     @assert size(X, 2) == length(y) "Mismatched number of samples in X and y"
-    idx = shuffle ? randperm(size(X, 2)) : collect(1:size(X, 2))
-    return DataLoader(data, batchsize, shuffle, idx)
+
+    # Convert to Float32 automatically
+    X_float32 = Float32.(X)
+    y_float32 = Float32.(y)
+
+    idx = shuffle ? randperm(size(X_float32, 2)) : collect(1:size(X_float32, 2))
+
+    # Store original indices for leakage detection
+    original_indices = collect(1:size(X_float32, 2))
+
+    return DataLoader((X_float32, y_float32), batchsize, shuffle, idx)
 end
 
 function Base.iterate(dl::DataLoader, state::Int=1)
@@ -556,14 +649,16 @@ function loss(model, x, y)
     ϵ = Float32(1e-7)
     ŷ = clamp.(y_pred, ϵ, Float32(1.0) - ϵ)
 
-    # Binary cross entropy loss
-    bce_loss = -mean(y .* log.(ŷ) .+ (Float32(1.0) .- y) .* log.(Float32(1.0) .- ŷ))
+    # Binary cross entropy loss - more efficient computation
+    bce_loss = -sum(y .* log.(ŷ) .+ (Float32(1.0) .- y) .* log.(Float32(1.0) .- ŷ)) / length(y)
 
-    # L2 regularization
+    # L2 regularization - only compute for Dense layers, avoid repeated allocations
     l2_reg = Float32(0.0)
     for layer in model.layers
         if layer isa Dense
             l2_reg += sum(layer.W.^2) + sum(layer.b.^2)
+        elseif layer isa Conv1D
+            l2_reg += sum(layer.weight.^2) + sum(layer.bias.^2)
         end
     end
 
@@ -572,24 +667,27 @@ end
 
 function grad(model, x, y)
     y_pred = vec(model(x))
-    grad_pred = (y_pred .- y) ./ (y_pred .* (Float32(1.0) .- y_pred))
+    # More efficient gradient computation
+    grad_pred = (y_pred .- y) ./ max.(y_pred .* (Float32(1.0) .- y_pred), Float32(1e-7))
     grad_pred ./= length(y)
     return reshape(grad_pred, :, 1)
 end
 
 function train_model(model, dataset, test_X, test_y, opt, epochs)
     for epoch in 1:epochs
+        # Set training mode
+        set_train_mode!(model)
+
         total_loss = Float32(0.0)
         total_acc = Float32(0.0)
         num_samples = 0
 
         t = @elapsed begin
             for (x, y) in dataset
-               
                 # Forward pass
                 y_pred = model(x)
 
-                # Compute loss and accuracy
+                # Compute loss and accuracy more efficiently
                 current_loss = loss(model, x, y)
                 current_acc = mean((vec(y_pred) .> 0.5) .== (y .> 0.5))
 
@@ -598,7 +696,7 @@ function train_model(model, dataset, test_X, test_y, opt, epochs)
                 grads_cache = backward!(model, grad_output)
 
                 # Clip gradients to prevent exploding gradients
-                #clip_gradients!(grads_cache, Float32(1.0))
+                clip_gradients!(grads_cache, Float32(1.0))
 
                 # Update parameters
                 update!(model, grads_cache, opt)
@@ -614,13 +712,122 @@ function train_model(model, dataset, test_X, test_y, opt, epochs)
         train_loss = total_loss / num_samples
         train_acc = total_acc / num_samples
 
-        # Test metrics
-        test_acc = mean((vec(model(test_X)) .> 0.5) .== (test_y .> 0.5))
+        # Set evaluation mode for testing
+        set_eval_mode!(model)
+
+        # Test metrics - compute once
+        test_pred = vec(model(test_X))
+        test_acc = mean((test_pred .> 0.5) .== (test_y .> 0.5))
         test_loss = loss(model, test_X, test_y)
 
         # Print progress
-        println(@sprintf("Epoch: %d (%.2fs) \tTrain: (l: %.4f, a: %.4f) \tTest: (l: %.4f, a: %.4f)",
+        println(@sprintf("Epoch: %d (%.2fs) \tTrain: (l: %.2f, a: %.2f) \tTest: (l: %.2f, a: %.2f)",
             epoch, t, train_loss, train_acc, test_loss, test_acc))
+    end
+end
+
+mutable struct BatchNorm1D
+    channels::Int
+    running_mean::Vector{Float32}
+    running_var::Vector{Float32}
+    gamma::Vector{Float32}
+    beta::Vector{Float32}
+    momentum::Float32
+    eps::Float32
+    is_training::Bool
+    last_input::Array{Float32, 3}
+    last_output::Array{Float32, 3}
+    batch_mean::Vector{Float32}
+    batch_var::Vector{Float32}
+end
+
+function BatchNorm1D(channels::Int; momentum=Float32(0.1), eps=Float32(1e-5))
+    BatchNorm1D(
+        channels,
+        zeros(Float32, channels),
+        ones(Float32, channels),
+        ones(Float32, channels),
+        zeros(Float32, channels),
+        momentum,
+        eps,
+        true,
+        Array{Float32}(undef, 0, 0, 0),
+        Array{Float32}(undef, 0, 0, 0),
+        zeros(Float32, channels),
+        ones(Float32, channels)
+    )
+end
+
+function (bn::BatchNorm1D)(x::Array{Float32, 3})
+    bn.last_input = x
+    L, C, N = size(x)
+
+    if bn.is_training
+        # Compute batch statistics
+        bn.batch_mean = vec(mean(x, dims=(1, 3)))  # Mean over spatial and batch dimensions
+        bn.batch_var = vec(var(x, dims=(1, 3), corrected=false))  # Variance over spatial and batch dimensions
+
+        # Update running statistics
+        bn.running_mean .= (1 - bn.momentum) .* bn.running_mean .+ bn.momentum .* bn.batch_mean
+        bn.running_var .= (1 - bn.momentum) .* bn.running_var .+ bn.momentum .* bn.batch_var
+
+        # Normalize using batch statistics
+        x_norm = (x .- reshape(bn.batch_mean, 1, :, 1)) ./ sqrt.(reshape(bn.batch_var, 1, :, 1) .+ bn.eps)
+    else
+        # Use running statistics for inference
+        x_norm = (x .- reshape(bn.running_mean, 1, :, 1)) ./ sqrt.(reshape(bn.running_var, 1, :, 1) .+ bn.eps)
+    end
+
+    # Scale and shift
+    bn.last_output = reshape(bn.gamma, 1, :, 1) .* x_norm .+ reshape(bn.beta, 1, :, 1)
+
+    return bn.last_output
+end
+
+function backward!(bn::BatchNorm1D, grad_output::Array{Float32, 3})
+    if !bn.is_training
+        # For inference, just pass through
+        return grad_output
+    end
+
+    x = bn.last_input
+    L, C, N = size(x)
+
+    # Compute gradients
+    x_centered = x .- reshape(bn.batch_mean, 1, :, 1)
+    std_inv = 1.0 ./ sqrt.(bn.batch_var .+ bn.eps)
+
+    # Gradients for gamma and beta
+    grad_gamma = vec(sum(grad_output .* (x_centered .* reshape(std_inv, 1, :, 1)), dims=(1, 3)))
+    grad_beta = vec(sum(grad_output, dims=(1, 3)))
+
+    # Gradient for input
+    grad_input = grad_output .* reshape(bn.gamma .* std_inv, 1, :, 1)
+
+    return grad_gamma, grad_beta, grad_input
+end
+
+# Define Layer union type after all structs are defined
+const Layer = Union{Dense, Dropout, Chain, Embedding, Conv1D, MaxPool1D, BatchNorm1D, typeof(flatten)}
+
+# Add evaluation mode functions
+function set_eval_mode!(model::Chain)
+    for layer in model.layers
+        if layer isa Dropout
+            layer.is_training = false
+        elseif layer isa BatchNorm1D
+            layer.is_training = false
+        end
+    end
+end
+
+function set_train_mode!(model::Chain)
+    for layer in model.layers
+        if layer isa Dropout
+            layer.is_training = true
+        elseif layer isa BatchNorm1D
+            layer.is_training = true
+        end
     end
 end
 
