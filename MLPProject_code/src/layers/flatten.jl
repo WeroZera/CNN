@@ -1,1 +1,0 @@
-flatten(x) = reshape(x, :, size(x, 3))
