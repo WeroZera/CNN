@@ -2,133 +2,130 @@ module AD
 
 export ADValue, grad, unwrap, binarycrossentropy
 
-import Base: +, -, *, /, zero, one, sum, exp, clamp
+import Base: +, -, *, /, exp, clamp, zero, one
 
-struct ADValue
+mutable struct ADValue
     value::Float64
     grad::Float64
-    ADValue(v::Number, g::Number) = new(float(v), float(g))
-end
+    parents::Vector{Tuple{ADValue, Function}} 
 
-ADValue(v::Number) = ADValue(v, 0.0)
+    ADValue(v::Float64) = new(v, 0.0, [])
+end
 
 unwrap(x::ADValue) = x.value
 unwrap(x) = x
 
-# Operator +
-+(a::ADValue, b::ADValue) = ADValue(a.value + b.value, a.grad + b.grad)
-+(a::ADValue, b::Number) = ADValue(a.value + b, a.grad)
-+(a::Number, b::ADValue) = ADValue(a + b.value, b.grad)
+# Add 
++(a::ADValue, b::ADValue) = begin
+    out = ADValue(a.value + b.value)
+    push!(out.parents, (a, Δ -> Δ))
+    push!(out.parents, (b, Δ -> Δ))
+    return out
+end
++(a::ADValue, b::Number) = a + ADValue(b)
++(a::Number, b::ADValue) = ADValue(a) + b
 
-# Operator -
--(a::ADValue, b::ADValue) = ADValue(a.value - b.value, a.grad - b.grad)
--(a::ADValue, b::Number) = ADValue(a.value - b, a.grad)
--(a::Number, b::ADValue) = ADValue(a - b.value, -b.grad)
+# Subtract 
+-(a::ADValue, b::ADValue) = begin
+    out = ADValue(a.value - b.value)
+    push!(out.parents, (a, Δ -> Δ))
+    push!(out.parents, (b, Δ -> -Δ))
+    return out
+end
+-(a::ADValue, b::Number) = a - ADValue(b)
+-(a::Number, b::ADValue) = ADValue(a) - b
 
-# Operator *
-*(a::ADValue, b::ADValue) = ADValue(a.value * b.value, a.grad * b.value + a.value * b.grad)
-*(a::ADValue, b::Number) = ADValue(a.value * b, a.grad * b)
-*(a::Number, b::ADValue) = ADValue(a * b.value, a * b.grad)
+# Multiply
+*(a::ADValue, b::ADValue) = begin
+    out = ADValue(a.value * b.value)
+    push!(out.parents, (a, Δ -> Δ * b.value))
+    push!(out.parents, (b, Δ -> Δ * a.value))
+    return out
+end
+*(a::ADValue, b::Number) = a * ADValue(b)
+*(a::Number, b::ADValue) = ADValue(a) * b
 
-# Operator /
-/(a::ADValue, b::ADValue) = ADValue(a.value / b.value, (a.grad * b.value - a.value * b.grad) / b.value^2)
-(/)(a::ADValue, b::Number) = ADValue(a.value / b, a.grad / b)
-(/)(a::Number, b::ADValue) = ADValue(a / b.value, (-a * b.grad) / b.value^2)
+# Divide
+/(a::ADValue, b::ADValue) = begin
+    out = ADValue(a.value / b.value)
+    push!(out.parents, (a, Δ -> Δ / b.value))
+    push!(out.parents, (b, Δ -> -Δ * a.value / b.value^2))
+    return out
+end
+/(a::ADValue, b::Number) = a / ADValue(b)
+/(a::Number, b::ADValue) = ADValue(a) / b
 
-# Operator unary -
--(a::ADValue) = ADValue(-a.value, -a.grad)
 
-# zero & one
-zero(::Type{ADValue}) = ADValue(0.0, 0.0)
-one(::Type{ADValue}) = ADValue(1.0, 0.0)
-
-# exp
-exp(a::ADValue) = ADValue(exp(a.value), exp(a.value) * a.grad)
-
-# clamp
-clamp(x::ADValue, lo, hi) = ADValue(clamp(x.value, lo, hi), x.grad * (x.value > lo && x.value < hi ? 1.0 : 0.0))
-
-# sum – tylko dla Array{ADValue}
-sum(arr::AbstractArray{ADValue}) = foldl((a, b) -> a + b, arr)
-
-import Base: copy
-function copy(x::ADValue)
-    ADValue(x.value, x.grad)
+-(a::ADValue) = begin
+    out = ADValue(-a.value)
+    push!(out.parents, (a, Δ -> -Δ))
+    return out
 end
 
-# Funkcja sigmoid
+
+exp(a::ADValue) = begin
+    out = ADValue(exp(a.value))
+    push!(out.parents, (a, Δ -> Δ * out.value))
+    return out
+end
+
+
+clamp(x::ADValue, lo, hi) = begin
+    v = clamp(x.value, lo, hi)
+    out = ADValue(v)
+    grad_fn = Δ -> (x.value > lo && x.value < hi) ? Δ : 0.0
+    push!(out.parents, (x, grad_fn))
+    return out
+end
+
+
+zero(::Type{ADValue}) = ADValue(0.0)
+one(::Type{ADValue}) = ADValue(1.0)
+
+
+function sum(arr::AbstractArray{ADValue})
+    result = zero(ADValue)
+    for x in arr
+        result += x
+    end
+    return result
+end
+
+
 function sigmoid(x::ADValue)
-    sig = 1 / (1 + exp(-x))
-    # pochodna sigmoid(x) = sigmoid(x)*(1-sigmoid(x))
-    return sig
+    s = 1 / (1 + exp(-x))
+    return s  
 end
 
-# Binary cross entropy function
+
 function binarycrossentropy(ŷ, y)
     ϵ = 1e-7
     ŷ_clamped = clamp.(ŷ, ϵ, 1.0 - ϵ)
     return -mean(y .* log.(ŷ_clamped) .+ (1.0 .- y) .* log.(1.0 .- ŷ_clamped))
 end
 
-import Base: size
-size(x::ADValue) = ()
-
-import Base: length
-length(x::ADValue) = 1
-
-# grad – liczy gradient po parametrach modelu względem funkcji f
-function grad(f, params)
-    # Zamieniamy wszystkie parametry na ADValue, liczymy pochodną po każdym z nich
-    orig_params = [copy(p) for p in params]
-    grads = [zeros(Float64, size(p)) for p in params]
-    l = 0.0
-
-    for i in eachindex(params)
-        p = params[i]
-        if p isa ADValue
-            # Handle scalar ADValue case
-            ad_params = [copy(x) for x in params]
-            ad_params[i] = ADValue(p.value, 1.0)
-            for j in 1:length(params)
-                if j != i
-                    if params[j] isa ADValue
-                        ad_params[j] = ADValue(params[j].value, 0.0)
-                    else
-                        ad_params[j] = map(x -> ADValue(x, 0.0), params[j])
-                    end
-                end
-            end
-            lval = f(ad_params...)
-            grads[i] = lval.grad
-            if i == 1
-                l = lval.value
-            end
-        else
-            # Handle array case
-            sz = size(p)
-            g = zeros(Float64, sz)
-            for idx in CartesianIndices(sz)
-                ad_params = [copy(x) for x in params]
-                ad_params[i][idx] = ADValue(p[idx], 1.0)
-                for j in 1:length(params)
-                    if j != i
-                        if params[j] isa ADValue
-                            ad_params[j] = ADValue(params[j].value, 0.0)
-                        else
-                            ad_params[j] = map(x -> ADValue(x, 0.0), params[j])
-                        end
-                    end
-                end
-                lval = f(ad_params...)
-                g[idx] = lval.grad
-                if i == 1 && idx == CartesianIndex((ones(Int, ndims(p)))...)
-                    l = lval.value
-                end
-            end
-            grads[i] = g
+function backward(output::ADValue)
+    output.grad = 1.0
+    visited = Set{ADValue}()
+    function _backward(node::ADValue)
+        if node ∈ visited
+            return
+        end
+        union!(visited, [node])
+        for (parent, grad_fn) in node.parents
+            parent.grad += grad_fn(node.grad)
+            _backward(parent)
         end
     end
-    return grads, l
+    _backward(output)
+end
+
+function grad(f, params)
+    ad_params = map(p -> map(x -> ADValue(x), p), params)
+    out = f(ad_params...)
+    backward(out)
+    grads = map(p -> map(x -> x.grad, p), ad_params)
+    return grads, out.value
 end
 
 end # module
