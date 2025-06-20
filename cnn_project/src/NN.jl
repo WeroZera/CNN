@@ -1,6 +1,6 @@
 module NN
 
-using ..AD
+import ..AD
 using Random
 using LinearAlgebra
 using Statistics
@@ -44,12 +44,14 @@ include("data_loader.jl")
 const Layer = Union{Dense, Dropout, Chain, Embedding, Conv1D, MaxPool1D, BatchNorm1D, typeof(flatten)}
 
 
-export Dense, Chain, relu, sigmoid, softmax, binarycrossentropy, params, update!,
-       DataLoader, Adam, Dropout, clip_gradients!, train_model,
+export Dense, Chain, binarycrossentropy, params, update!,
+       DataLoader, Adam, Dropout, train_model,
        Embedding, Conv1D, MaxPool1D, flatten, BatchNorm1D,
        set_eval_mode!, set_train_mode!
 
 const ADValue = AD.ADValue
+binarycrossentropy(ŷ, y) = AD.binarycrossentropy(ŷ, y)
+
 
 function (c::Chain)(x)
     for (i, l) in enumerate(c.layers)
@@ -244,54 +246,6 @@ function setparams!(model, new_params)
     end
 end
 
-binarycrossentropy(ŷ, y) = AD.binarycrossentropy(ŷ, y)
-
-
-function clip_gradients!(grads, clip_value=Float32(1.0))
-    for grad in grads
-        if grad !== nothing
-            if isa(grad, Tuple) && length(grad) == 2 &&
-               isa(grad[1], AbstractArray{Float32}) && isa(grad[2], AbstractArray{Float32})
-                gW, gb = grad
-                norm = sqrt(sum(gW.^2) + sum(gb.^2))
-                if norm > clip_value
-                    scale = clip_value / (norm + Float32(1e-6))
-                    gW .*= scale
-                    gb .*= scale
-                end
-            end
-        end
-    end
-end
-
-function loss(model, x, y)
-    y_pred = vec(model(x))
-    ϵ = Float32(1e-7)
-    ŷ = clamp.(y_pred, ϵ, Float32(1.0) - ϵ)
-
-    # Binary cross entropy loss - more efficient computation
-    bce_loss = -sum(y .* log.(ŷ) .+ (Float32(1.0) .- y) .* log.(Float32(1.0) .- ŷ)) / length(y)
-
-    # L2 regularization - only compute for Dense layers, avoid repeated allocations
-    l2_reg = Float32(0.0)
-    for layer in model.layers
-        if layer isa Dense
-            l2_reg += sum(layer.W.^2) + sum(layer.b.^2)
-        elseif layer isa Conv1D
-            l2_reg += sum(layer.weight.^2) + sum(layer.bias.^2)
-        end
-    end
-
-    return bce_loss + Float32(0.0001) * l2_reg
-end
-
-function grad(model, x, y)
-    y_pred = vec(model(x))
-    # Efficient gradient computation
-    grad_pred = (y_pred .- y) ./ max.(y_pred .* (Float32(1.0) .- y_pred), Float32(1e-7))
-    grad_pred ./= length(y)
-    return reshape(grad_pred, :, 1)
-end
 
 function train_model(model, dataset, test_X, test_y, opt, epochs)
     for epoch in 1:epochs
@@ -309,15 +263,15 @@ function train_model(model, dataset, test_X, test_y, opt, epochs)
                 y_pred = model(x)
 
                 # Compute loss and accuracy more efficiently
-                current_loss = loss(model, x, y)
+                current_loss = AD.loss(model, x, y)
                 current_acc = mean((vec(y_pred) .> 0.5) .== (y .> 0.5))
 
                 # Backward pass - compute gradients
-                grad_output = grad(model, x, y)
+                grad_output = AD.grad(model, x, y)
                 grads_cache = backward!(model, grad_output)
 
                 # Clip gradients to prevent exploding gradients
-                clip_gradients!(grads_cache, Float32(1.0))
+                AD.clip_gradients!(grads_cache, Float32(1.0))
 
                 # Update parameters
                 update!(model, grads_cache, opt)
@@ -343,7 +297,7 @@ function train_model(model, dataset, test_X, test_y, opt, epochs)
         # Test metrics - compute once
         test_pred = vec(model(test_X))
         test_acc = mean((test_pred .> 0.5) .== (test_y .> 0.5))
-        test_loss = loss(model, test_X, test_y)
+        test_loss = AD.loss(model, test_X, test_y)
 
         # Print progress
         println(@sprintf("Epoch: %d (%.2fs) \tTrain: (l: %.2f, a: %.2f) \tTest: (l: %.2f, a: %.2f) \tMemory allocated: %.3f MB",
@@ -352,25 +306,8 @@ function train_model(model, dataset, test_X, test_y, opt, epochs)
 end
 
 
-# Define activation functions
-relu(x) = x > 0 ? x : Float32(0)
-relu(x::AbstractArray) = max.(x, Float32(0))
 
-# LeakyReLU - often better than ReLU
-leakyrelu(x, α=Float32(0.01)) = x > 0 ? x : α * x
-leakyrelu(x::AbstractArray, α=Float32(0.01)) = max.(x, α .* x)
 
-# ELU - exponential linear unit
-elu(x, α=Float32(1.0)) = x > 0 ? x : α * (exp(x) - 1)
-elu(x::AbstractArray, α=Float32(1.0)) = x .> 0 ? x : α .* (exp.(x) .- 1)
-
-sigmoid(x) = Float32(1) / (Float32(1) + exp(-x))
-sigmoid(x::AbstractArray) = Float32(1) ./ (Float32(1) .+ exp.(-x))
-
-softmax(xs) = begin
-    exps = exp.(xs .- maximum(xs))
-    exps ./ sum(exps)
-end
 
 
 # Add evaluation mode functions

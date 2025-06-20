@@ -11,7 +11,7 @@ end
 
 function Conv1D(k::Int, c_in::Int, c_out::Int, activation=relu)
     # Use He initialization for ReLU activations
-    if activation == relu
+    if activation == AD.relu
         he_std = sqrt(2.0 / (k * c_in))
         weight = randn(Float32, k, c_in, c_out) .* he_std
     else

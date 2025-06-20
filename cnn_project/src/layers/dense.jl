@@ -52,11 +52,11 @@ function backward!(d::Dense, grad_output::Matrix{Float32})
 
     # Compute gradient of activation more efficiently
     grad_pre_activation = similar(grad_output)
-    if d.σ == relu
+    if d.σ == AD.relu
         @inbounds for i in eachindex(grad_pre_activation)
             grad_pre_activation[i] = d.last_pre_activation[i] > 0 ? grad_output[i] : Float32(0)
         end
-    elseif d.σ == sigmoid
+    elseif d.σ == AD.sigmoid
         @inbounds for i in eachindex(grad_pre_activation)
             s = d.last_output[i]
             grad_pre_activation[i] = grad_output[i] * s * (Float32(1) - s)

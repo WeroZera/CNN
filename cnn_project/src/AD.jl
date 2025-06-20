@@ -1,8 +1,8 @@
 module AD
 
-export ADValue, grad, unwrap, binarycrossentropy
+export ADValue, grad, unwrap, binarycrossentropy, clip_gradients!, loss
 
-import Base: +, -, *, /, exp, clamp, zero, one
+import Base: +, -, *, /, zero, one, sum, exp, clamp
 
 mutable struct ADValue
     value::Float64
@@ -78,23 +78,24 @@ clamp(x::ADValue, lo, hi) = begin
     return out
 end
 
+# Define activation functions
+relu(x) = x > 0 ? x : Float32(0)
+relu(x::AbstractArray) = max.(x, Float32(0))
 
-zero(::Type{ADValue}) = ADValue(0.0)
-one(::Type{ADValue}) = ADValue(1.0)
+# LeakyReLU - often better than ReLU
+leakyrelu(x, α=Float32(0.01)) = x > 0 ? x : α * x
+leakyrelu(x::AbstractArray, α=Float32(0.01)) = max.(x, α .* x)
 
+# ELU - exponential linear unit
+elu(x, α=Float32(1.0)) = x > 0 ? x : α * (exp(x) - 1)
+elu(x::AbstractArray, α=Float32(1.0)) = x .> 0 ? x : α .* (exp.(x) .- 1)
 
-function sum(arr::AbstractArray{ADValue})
-    result = zero(ADValue)
-    for x in arr
-        result += x
-    end
-    return result
-end
+sigmoid(x) = Float32(1) / (Float32(1) + exp(-x))
+sigmoid(x::AbstractArray) = Float32(1) ./ (Float32(1) .+ exp.(-x))
 
-
-function sigmoid(x::ADValue)
-    s = 1 / (1 + exp(-x))
-    return s  
+softmax(xs) = begin
+    exps = exp.(xs .- maximum(xs))
+    exps ./ sum(exps)
 end
 
 
@@ -103,6 +104,7 @@ function binarycrossentropy(ŷ, y)
     ŷ_clamped = clamp.(ŷ, ϵ, 1.0 - ϵ)
     return -mean(y .* log.(ŷ_clamped) .+ (1.0 .- y) .* log.(1.0 .- ŷ_clamped))
 end
+
 
 function backward(output::ADValue)
     output.grad = 1.0
@@ -120,12 +122,33 @@ function backward(output::ADValue)
     _backward(output)
 end
 
-function grad(f, params)
-    ad_params = map(p -> map(x -> ADValue(x), p), params)
-    out = f(ad_params...)
-    backward(out)
-    grads = map(p -> map(x -> x.grad, p), ad_params)
-    return grads, out.value
+function loss(model, x, y)
+    y_pred = vec(model(x))
+    ϵ = 1e-7
+    ŷ = clamp.(y_pred, ϵ, 1.0 - ϵ)
+    return -sum(y .* log.(ŷ) .+ (1 .- y) .* log.(1 .- ŷ)) / length(y)
+end
+
+function grad(model, x, y)
+    y_pred = vec(model(x))
+    ϵ = 1e-7
+    y_pred_clamped = clamp.(y_pred, ϵ, 1.0 - ϵ)
+    grad_pred = (y_pred_clamped .- y) ./ max.(y_pred_clamped .* (1 .- y_pred_clamped), ϵ)
+    return reshape(grad_pred ./ length(y), :, 1)
+end
+
+function clip_gradients!(grads, clip_value=1.0f0)
+    for grad in grads
+        if grad isa Tuple{<:AbstractArray{Float32}, <:AbstractArray{Float32}}
+            gW, gb = grad
+            norm = sqrt(sum(gW.^2) + sum(gb.^2))
+            if norm > clip_value
+                scale = clip_value / (norm + 1e-6f0)
+                gW .*= scale
+                gb .*= scale
+            end
+        end
+    end
 end
 
 end # module
