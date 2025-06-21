@@ -1,4 +1,4 @@
-mutable struct Conv1D
+mutable struct Conv1D                                                            #trzeba usunąć ze struct wszędzie mutable bo on tak nie lubi
     kernel_size::Int
     in_channels::Int
     out_channels::Int
@@ -33,8 +33,7 @@ function (c::Conv1D)(x::Array{Float32, 3})
     out_len = L - k + 1
     y = Array{Float32}(undef, out_len, c.out_channels, N)
 
-    # Pre-allocate col matrix to avoid repeated allocations
-    col = Array{Float32}(undef, k * C, out_len)
+    col = Array{Float32}(undef, k * C, out_len)                                    #trzeba przenieść do struct takie wartości zapisywane w funkcjach, żeby w funkcji się nie twotzyły tylko już zapisywały w istniejącej wartości
 
     # Reshape weight once
     kernels = reshape(c.weight, k * C, c.out_channels)
