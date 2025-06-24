@@ -11,6 +11,7 @@ mutable struct BatchNorm1D
     last_output::Array{Float32, 3}
     batch_mean::Vector{Float32}
     batch_var::Vector{Float32}
+    grad_input::Array{Float32, 3}
 end
 
 function BatchNorm1D(channels::Int; momentum=Float32(0.1), eps=Float32(1e-5))
@@ -26,7 +27,8 @@ function BatchNorm1D(channels::Int; momentum=Float32(0.1), eps=Float32(1e-5))
         Array{Float32}(undef, 0, 0, 0),
         Array{Float32}(undef, 0, 0, 0),
         zeros(Float32, channels),
-        ones(Float32, channels)
+        ones(Float32, channels),
+        Array{Float32}(undef, 0, 0, 0)
     )
 end
 
@@ -35,46 +37,40 @@ function (bn::BatchNorm1D)(x::Array{Float32, 3})
     L, C, N = size(x)
 
     if bn.is_training
-        # Compute batch statistics
-        bn.batch_mean = vec(mean(x, dims=(1, 3)))  # Mean over spatial and batch dimensions
-        bn.batch_var = vec(var(x, dims=(1, 3), corrected=false))  # Variance over spatial and batch dimensions
+        bn.batch_mean = vec(mean(x, dims=(1, 3)))
+        bn.batch_var = vec(var(x, dims=(1, 3), corrected=false))
 
-        # Update running statistics
         bn.running_mean .= (1 - bn.momentum) .* bn.running_mean .+ bn.momentum .* bn.batch_mean
         bn.running_var .= (1 - bn.momentum) .* bn.running_var .+ bn.momentum .* bn.batch_var
 
-        # Normalize using batch statistics
         x_norm = (x .- reshape(bn.batch_mean, 1, :, 1)) ./ sqrt.(reshape(bn.batch_var, 1, :, 1) .+ bn.eps)
     else
-        # Use running statistics for inference
         x_norm = (x .- reshape(bn.running_mean, 1, :, 1)) ./ sqrt.(reshape(bn.running_var, 1, :, 1) .+ bn.eps)
     end
 
-    # Scale and shift
     bn.last_output = reshape(bn.gamma, 1, :, 1) .* x_norm .+ reshape(bn.beta, 1, :, 1)
-
     return bn.last_output
 end
 
 function backward!(bn::BatchNorm1D, grad_output::Array{Float32, 3})
     if !bn.is_training
-        # For inference, just pass through
         return grad_output
     end
 
     x = bn.last_input
     L, C, N = size(x)
 
-    # Compute gradients
+    if size(bn.grad_input) != size(x)
+        bn.grad_input = zeros(Float32, size(x))
+    end
+
     x_centered = x .- reshape(bn.batch_mean, 1, :, 1)
     std_inv = 1.0 ./ sqrt.(bn.batch_var .+ bn.eps)
 
-    # Gradients for gamma and beta
     grad_gamma = vec(sum(grad_output .* (x_centered .* reshape(std_inv, 1, :, 1)), dims=(1, 3)))
     grad_beta = vec(sum(grad_output, dims=(1, 3)))
 
-    # Gradient for input
-    grad_input = grad_output .* reshape(bn.gamma .* std_inv, 1, :, 1)
+    bn.grad_input .= grad_output .* reshape(bn.gamma .* std_inv, 1, :, 1)
 
-    return grad_gamma, grad_beta, grad_input
+    return grad_gamma, grad_beta, bn.grad_input
 end

@@ -139,7 +139,6 @@ function backward!(c::Chain, grad_output::Matrix{Float32})
     return c.grad_cache
 end
 
-
 function update!(model::Chain, grads_cache, opt::Adam)
     for (i, layer) in enumerate(model.layers)
         grads = grads_cache[i]
@@ -217,7 +216,6 @@ function update!(model::Chain, grads_cache, opt::Adam)
     end
 end
 
-
 function params(model)
     ps = []
     if model isa Dense
@@ -245,7 +243,6 @@ function setparams!(model, new_params)
         end
     end
 end
-
 
 function train_model(model, dataset, test_X, test_y, opt, epochs)
     for epoch in 1:epochs
@@ -305,11 +302,6 @@ function train_model(model, dataset, test_X, test_y, opt, epochs)
     end
 end
 
-
-
-
-
-
 # Add evaluation mode functions
 function set_eval_mode!(model::Chain)
     for layer in model.layers
@@ -330,6 +322,5 @@ function set_train_mode!(model::Chain)
         end
     end
 end
-
 
 end # module

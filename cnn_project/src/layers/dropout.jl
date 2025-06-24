@@ -10,7 +10,7 @@ end
 
 function (d::Dropout)(x::AbstractArray)
     if d.is_training
-        T = eltype(x)  
+        T = eltype(x)
         d.mask = rand(T, size(x)) .>= T(d.p)  # generate mask with correct type
         return x .* d.mask ./ (T(1.0) - T(d.p))  # scale to preserve expectation
     else
