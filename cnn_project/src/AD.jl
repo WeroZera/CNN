@@ -7,7 +7,7 @@ import Base: +, -, *, /, zero, one, sum, exp, clamp
 mutable struct ADValue
     value::Float64
     grad::Float64
-    parents::Vector{Tuple{ADValue, Function}} 
+    parents::Vector{Tuple{ADValue, Function}}
 
     ADValue(v::Float64) = new(v, 0.0, [])
 end
@@ -15,7 +15,7 @@ end
 unwrap(x::ADValue) = x.value
 unwrap(x) = x
 
-# Add 
+# Add
 +(a::ADValue, b::ADValue) = begin
     out = ADValue(a.value + b.value)
     push!(out.parents, (a, Δ -> Δ))
@@ -25,7 +25,7 @@ end
 +(a::ADValue, b::Number) = a + ADValue(b)
 +(a::Number, b::ADValue) = ADValue(a) + b
 
-# Subtract 
+# Subtract
 -(a::ADValue, b::ADValue) = begin
     out = ADValue(a.value - b.value)
     push!(out.parents, (a, Δ -> Δ))
@@ -137,13 +137,13 @@ function grad(model, x, y)
     return reshape(grad_pred ./ length(y), :, 1)
 end
 
-function clip_gradients!(grads, clip_value=1.0f0)
+function clip_gradients!(grads, clip_value=Float32(1.0))
     for grad in grads
         if grad isa Tuple{<:AbstractArray{Float32}, <:AbstractArray{Float32}}
             gW, gb = grad
             norm = sqrt(sum(gW.^2) + sum(gb.^2))
             if norm > clip_value
-                scale = clip_value / (norm + 1e-6f0)
+                scale = clip_value / (norm + Float32(1e-6))
                 gW .*= scale
                 gb .*= scale
             end

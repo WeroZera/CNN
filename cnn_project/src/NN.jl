@@ -267,7 +267,7 @@ function train_model(model, dataset, test_X, test_y, opt, epochs)
                 current_acc = mean((vec(y_pred) .> 0.5) .== (y .> 0.5))
 
                 # Backward pass - compute gradients
-                grad_output = AD.grad(model, x, y)
+                grad_output = Float32.(AD.grad(model, x, y))
                 grads_cache = backward!(model, grad_output)
 
                 # Clip gradients to prevent exploding gradients
